@@ -1,0 +1,47 @@
+Signature: mbdpi.reverse_once(state, rng, Ybar_i, noise_scale)
+Source:   
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def reverse_once(self, state, rng, Ybar_i, noise_scale):
+        # sample from q_i
+        rng, Y0s_rng = jax.random.split(rng)
+        eps_Y = jax.random.normal(
+            Y0s_rng, (self.args.Nsample, self.args.Hnode + 1, self.nu)
+        )
+        Y0s = eps_Y * noise_scale[None, :, None] + Ybar_i
+        # we can't change the first control
+        Y0s = Y0s.at[:, 0].set(Ybar_i[0, :])
+        # append Y0s with Ybar_i to also evaluate Ybar_i
+        Y0s = jnp.concatenate([Y0s, Ybar_i[None]], axis=0)
+        Y0s = jnp.clip(Y0s, -1.0, 1.0)
+        # convert Y0s to us
+        us = self.node2u_vvmap(Y0s)
+
+        # esitimate mu_0tm1
+        rewss, pipeline_statess = self.rollout_us_vmap(state, us)
+        rew_Ybar_i = rewss[-1].mean()
+        qss = pipeline_statess.q
+        qdss = pipeline_statess.qd
+        xss = pipeline_statess.x.pos
+        rews = rewss.mean(axis=-1)
+        logp0 = (rews - rew_Ybar_i) / rews.std(axis=-1) / self.args.temp_sample
+
+        weights = jax.nn.softmax(logp0)
+        Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
+
+        # NOTE: update only with reward
+        Ybar = jnp.einsum("n,nij->ij", weights, Y0s)
+        qbar = jnp.einsum("n,nij->ij", weights, qss)
+        qdbar = jnp.einsum("n,nij->ij", weights, qdss)
+        xbar = jnp.einsum("n,nijk->ijk", weights, xss)
+
+        info = {
+            "rews": rews,
+            "qbar": qbar,
+            "qdbar": qdbar,
+            "xbar": xbar,
+            "new_noise_scale": new_noise_scale,
+        }
+
+        return rng, Ybar, info
+File:      ~/Repos/dial-mpc/dial_mpc/core/dial_core.py
+Type:      method

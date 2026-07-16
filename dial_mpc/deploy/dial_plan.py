@@ -36,6 +36,7 @@ from dial_mpc.utils.io_utils import (
 )
 from dial_mpc.examples import deploy_examples
 
+
 # Tell XLA to use Triton GEMM, this improves steps/sec by ~30% on some GPUs
 xla_flags = os.environ.get("XLA_FLAGS", "")
 xla_flags += " --xla_gpu_triton_gemm_any=True"
@@ -57,9 +58,10 @@ def pipeline_init(
     offset = Transform.create(pos=offset)
     xd = offset.vmap().do(cvel)
 
-    data = _reformat_contact(sys, data)
-    return MjxState(q=q, qd=qd, x=x, xd=xd, **data.__dict__)
-
+    # local patch vs upstream dial-mpc: _reformat_contact takes (sys, contact) and
+    # returns a Contact in current brax; upstream passed/kept the whole `data`
+    contact = _reformat_contact(sys, data.contact)
+    return MjxState(q=q, qd=qd, x=x, xd=xd, contact=contact, **data.__dict__)
 
 class MBDPublisher:
     def __init__(
@@ -196,16 +198,22 @@ class MBDPublisher:
                 print("Performing JIT on DIAL-MPC")
                 n_diffuse = self.dial_config.Ndiffuse_init
                 first_time = False
+                # scale the noise by the per-node schedule MBDPI.sigma_control, as
+                # dial_core.py does. Without it every node gets flat noise 1.0 and
+                # sigma_scale / horizon_diffuse_factor become inert.
                 traj_diffuse_factors = (
-                    self.dial_config.traj_diffuse_factor
+                    self.mbdpi.sigma_control[None, :]
+                    * self.dial_config.traj_diffuse_factor
                     ** (jnp.arange(n_diffuse))[:, None]
                 )
                 (self.rng, self.Y, _), info = jax.lax.scan(
                     reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
                 )
                 n_diffuse = self.dial_config.Ndiffuse
+            # same per-node sigma_control scaling as above (dial_core.py parity)
             traj_diffuse_factors = (
-                self.dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
+                self.mbdpi.sigma_control[None, :]
+                * self.dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
             )
             (self.rng, self.Y, _), info = jax.lax.scan(
                 reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
@@ -217,7 +225,13 @@ class MBDPublisher:
             us = self.mbdpi.node2u_vmap(self.Y)
             # unnormalize control
             joint_targets = self.env.act2joint(us)
-            taus = self.env.act2tau(us, state.pipeline_state)
+            # local patch vs upstream: direct-ctrl envs (Block1DEnv.act2ctrl,
+            # envs/block1d_env.py) bypass act2tau, whose PD math assumes a legged
+            # robot with qpos[7:] actuated. Legged envs are unaffected (no act2ctrl).
+            if hasattr(self.env, "act2ctrl"):
+                taus = self.env.act2ctrl(us)
+            else:
+                taus = self.env.act2tau(us, state.pipeline_state)
             # send control
             self.acts_shared[: joint_targets.shape[0], :] = joint_targets
             self.tau_shared[: taus.shape[0], :] = taus

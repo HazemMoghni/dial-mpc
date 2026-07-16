@@ -28,6 +28,7 @@ setup(
             "dial-mpc-sim=dial_mpc.deploy.dial_sim:main",
             "dial-mpc-real=dial_mpc.deploy.dial_real:main",
             "dial-mpc-plan=dial_mpc.deploy.dial_plan:main",
+            # "dial-mpc-lcm-bridge=dial_mpc.deploy.dial_lcm_bridge:main",  # LCM bridge parked in discard/deploy/
         ],
     },
 )

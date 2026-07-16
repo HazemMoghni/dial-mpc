@@ -1,0 +1,57 @@
+# block1d.yaml: sync (single-process) run of the block1d push task.
+# Launch: dial-mpc --example block1d
+# Layout mirrors dial_mpc/examples/unitree_h1_push_crate.yaml. Refs are repo-relative
+# path:line; sibling repos prefixed mujoco_mpc/, c3-lcs/. "Testbed" = the MJPC LCM runner,
+# mujoco_mpc/mjpc/standalone_block_push.cc.
+
+# ---- DIAL-MPC run ----
+seed: 0
+output_dir: block1d # bare name, not a path (shipped-config convention)
+n_steps:
+  200 # episode = 200 * dt = 4 s. Our choice
+  # (runs until Ctrl-C: while running.load(), standalone_block_push.cc:484)
+
+env_name:
+  block1d # registry key: register_environment (block1d_env.py bottom line)
+  # + the _configs dict entry (envs/__init__.py)
+
+# ---- DIAL solver knobs (DIAL-side tuning, not task fairness; dial-mpc defaults
+#      unless a study counterpart is noted) ----
+Nsample:
+  128 # samples per annealing iteration; dial-mpc default. (MJPC PS uses
+  # sampling_trajectories = 50, task_push.xml:22 -- a CPU/GPU budget, not fairness.)
+Hsample: 25 # horizon: 25 * dt = 0.5 s = agent_horizon numeric (task_push.xml:19)
+Hnode: 5 # spline knots = sampling_spline_points numeric (task_push.xml:23)
+Ndiffuse: 4 # annealing iterations per control step; dial-mpc default, no MJPC counterpart
+Ndiffuse_init: 10 # extra annealing on first step (cold start); dial-mpc default
+temp_sample: 0.05 # MPPI softmax temperature; dial-mpc default (MJPC PS has none)
+horizon_diffuse_factor: 0.9 # noise grading along horizon; shipped value
+traj_diffuse_factor: 0.5 # noise decay across annealing iterations; shipped value
+update_method:
+  mppi # (MJPC's sampling_exploration numeric = 0.1, task_push.xml:24, has no single
+  # DIAL equivalent; DIAL noise follows the two factors above)
+
+# ---- Base environment (BaseEnvConfig, dial_mpc/config/base_env_config.py) ----
+dt:
+  0.02 # control period. All shipped configs use 0.02; Hsample*dt = 0.5 s matches MJPC.
+  # No exact counterpart: MJPC replans continuously; C3 uses 0.05/0.025.
+timestep: 0.02 # physics step; n_frames = dt/timestep = 1 substep (BaseEnv.__init__, base_env.py:18)
+leg_control: torque # inert here: block1d_env writes ctrl directly, bypassing act2joint/act2tau
+action_scale: 1.0 # ctrl = clip(action * action_scale, ctrlrange); gear 6 => force +/-6 N
+
+# ---- Task fields (Block1DEnvConfig; read from this top level, like default_vx in
+#      unitree_h1_push_crate.yaml) ----
+vel_target:
+  0.3 # block x-vel target: block_vel_des (block_push.cc:48) AND
+  # block_vel_target (c3-lcs base_opts.yaml:21) -- the two stacks agree
+w_vel: 30.0 # "Block Velocity" user-sensor weight (task_push.xml:76)
+w_ctrl:
+  0.001 # "Actuation" user-sensor weight (task_push.xml:78); penalizes FORCE
+  # (data->actuator_force, block_push.cc:58), not raw ctrl
+block_init_x:
+  0.25 # "home" key qpos[0] (task_push.xml:69) = FLAGS_block_x default
+  # (standalone_block_push.cc:26)
+ee_init_x:
+  -0.04 # "home" key qpos[7] (task_push.xml:69). Testbed sweeps it (FLAGS_ee_x,
+  # default -1.52); C3 sim template equals it (q_init = [-0.04],
+  # c3-lcs/.../test_matrix/base_sim_params.yaml:18)

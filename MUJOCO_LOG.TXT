@@ -1,0 +1,21 @@
+Tue Jun  9 16:01:08 2026
+ERROR: could not initialize GLFW
+
+Tue Jun  9 16:05:02 2026
+ERROR: could not initialize GLFW
+
+Tue Jun  9 16:08:42 2026
+ERROR: could not initialize GLFW
+
+Tue Jun  9 16:24:15 2026
+ERROR: could not create window
+
+Tue Jun  9 16:27:33 2026
+ERROR: could not create window
+
+Tue Jun  9 17:23:46 2026
+ERROR: could not initialize GLFW
+
+Fri Jul 10 14:18:42 2026
+ERROR: could not initialize GLFW
+

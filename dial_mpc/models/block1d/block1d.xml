@@ -1,0 +1,101 @@
+<!-- block1d.xml: MJCF for the 1D block-push task (loaded by Block1DEnv.make_system).
+     Trimmed copy of the MJPC task model: mujoco_mpc/.../block/task_push.xml (+ its include
+     end_effector_push.xml). Physics values are verbatim from there; dropped pieces and why:
+       - mocap targets block_target/ee_target + sensors: their residual weights are 0
+         (task_push.xml:74-75) and the <sensor> residual moved into block1d_env.py rewards
+       - <custom> agent_*/sampling_* numerics: replaced by the yaml configs
+       - common.xml include, textures, <statistic>, <visual>, <size>: cosmetic only
+       - site "eeff" + site "world": existed only for the site actuator, replaced below
+
+     State layout (block1d_env.py indexes against this):
+       qpos = [block x y z, quat w x y z, ee_x]   -> block x = qpos[0], ee x = qpos[7]
+       qvel = [block vx vy vz, wx wy wz, ee_vx]   -> block vx = qvel[0], ee vx = qvel[6]
+-->
+<mujoco model="block1d">
+
+  <!-- from end_effector_push.xml:2; its balanceinertia is dropped (the one explicit
+       <inertial> below is already valid) -->
+  <compiler angle="radian" autolimits="true"/>
+
+  <!-- 0.005 = agent_timestep numeric (task_push.xml:20) = FLAGS_dt default (standalone_block_push.cc:29).
+       Standalone default only: the yaml `timestep` overrides this at load (make_system). -->
+  <option timestep="0.005" integrator="Euler"/>
+
+  <default>
+    <!-- contact stiffness for all geoms: default geom solref (task_push.xml:37). The
+         friction=0.3 beside it is dead (every colliding geom overrides friction); the
+         commented-out margin/solimp on task_push.xml:38 is the soft-contact knob applied
+         at runtime in diff mode only (solimp_width writes into geom_solimp/geom_margin,
+         standalone_block_push.cc:338-354), not part of the nominal task. -->
+    <geom solref=".001 1"/>
+  </default>
+
+  <worldbody>
+
+    <!-- the <light> in task_push.xml:48 (diffuse/specular/shadow dropped, cosmetic) -->
+    <light pos="0 -0.1 0.5" dir="0 0.2 -1" directional="true"/>
+
+    <!-- geom "floor", task_push.xml:50 verbatim (slide 0.1, torsional/rolling 0.003).
+         Effective block-ground mu 0.1 also equals Drake's harmonic mean of block mu 1.0
+         (drake:mu_dynamic, c3-lcs/.../block1d/urdf/block_sim.sdf) and ground mu 0.0527
+         (ground_static_mu, c3-lcs/.../block1d/parameters/scene.yaml:8); the stacks
+         agree. rgba is ours. -->
+    <geom name="floor" type="plane" size="0 0 0.05" pos="0 0 0"
+          friction="0.1 0.003 0.003" rgba="0.3 0.3 0.4 1"/>
+
+    <!-- body "block", task_push.xml:52-55. Its freejoint is unnamed there, named here so
+         it is referenceable. "1D" is enforced by the objective (residual penalizes full 3D
+         block velocity), not by the model. -->
+    <body name="block" pos="0 0 0">
+      <freejoint name="block_free"/>
+      <!-- geom "block": half-extents / mass verbatim (task_push.xml:54); equals the C3
+           block: 0.5 x 0.16 x 0.1 m box, 0.5 kg (link "block",
+           c3-lcs/.../block1d/urdf/block_sim.sdf). rgba is ours. -->
+      <geom name="block" type="box" size="0.25 0.08 0.05" mass="0.5"
+            friction="0.1 0.003 0.003" rgba="0.2 0.2 0.2 1"/>
+    </body>
+
+    <!-- end effector (pusher): body "ee", end_effector_push.xml:6-14 -->
+    <body name="ee" pos="0 0 0">
+      <!-- 1 prismatic x DOF: joint "end_effector_x" (end_effector_push.xml:11) verbatim
+           except the name; C3 calls the same joint "ee_x" (state_prediction_joints,
+           c3-lcs 1d_push.yaml), adopted here. The z joint is commented out in the source
+           (:12), confirming 1 DOF. range kept though unenforced: BaseEnv reads jnt_range
+           for act2joint scaling. -->
+      <joint name="ee_x" type="slide" axis="1 0 0" limited="false" range="-1.5 1.5" pos="0 0 0.05"/>
+      <!-- the <inertial> of body "ee", end_effector_push.xml:8 verbatim -->
+      <inertial mass="0.1" pos="0 0 0.075" diaginertia="0.001 0.001 0.001"/>
+      <!-- geom "ee", end_effector_push.xml:9-10 verbatim (priority 1 makes this geom's mu
+           1.0 win the EE-block pair while the block keeps mu 0.1 for the ground pair).
+           EE mu 1.0 matches C3 (drake:mu_static/mu_dynamic,
+           c3-lcs/.../block1d/urdf/planar_ee_sim.urdf:37-38). The source line carries a
+           "check friction coefficients" TODO; values match across stacks, but the TODO
+           stands. rgba is ours. -->
+      <geom name="ee" type="sphere" size="0.02" pos="0 0 0.05"
+            priority="1" condim="3" friction="1.0 0.003 0.003" margin="0" rgba="1 0.3 0.3 1"/>
+    </body>
+
+  </worldbody>
+
+  <actuator>
+    <!-- x force on the EE, |F| <= 6 N. Source is the <general site="eeff"> actuator
+         (end_effector_push.xml:18: gainprm 6, ctrlrange [-1,1], forcerange [-6,6],
+         world-x): for this 1-DOF body a joint motor with gear 6 is exactly equivalent (a
+         pure x force projects onto the slide DOF as 6*ctrl regardless of application
+         point; the forcerange clamp is then redundant). Joint transmission chosen as the
+         safe MJX path; site transmission support in MJX is the unverified case. Known
+         disagreement: C3's input limit is +/-20 N (u_horizontal_limits, c3-lcs
+         base_opts.yaml:15); MJPC's +/-6 N adopted per the take-MuJoCo-values decision. -->
+    <motor name="ee_x_motor" joint="ee_x" gear="6" ctrlrange="-1 1" ctrllimited="true"/>
+  </actuator>
+
+  <keyframe>
+    <!-- key "home", task_push.xml:69 verbatim: block xyz = 0.25 0 0.055 (z 5 mm high so
+         the block settles into contact), quat wxyz = 1 0 0 0, ee x = -0.04. Both x
+         entries are overridden per run by Block1DEnvConfig (block_init_x / ee_init_x),
+         mirroring the testbed's key_qpos[0]/[7] overwrite from FLAGS_block_x/FLAGS_ee_x
+         (standalone_block_push.cc:370-371). -->
+    <key name="home" qpos="0.25 0 0.055 1 0 0 0 -0.04"/>
+  </keyframe>
+
+</mujoco>

@@ -9,6 +9,10 @@ from dial_mpc.envs.unitree_go2_env import (
     UnitreeGo2SeqJumpEnvConfig,
     UnitreeGo2CrateEnvConfig,
 )
+
+# added for the block1d push task (see envs/block1d_env.py header for provenance)
+from dial_mpc.envs.block1d_env import Block1DEnvConfig
+
 from dial_mpc.envs.manipulation import AllegroReorientEnvConfig
 
 _configs = {
@@ -19,6 +23,7 @@ _configs = {
     "unitree_go2_seq_jump": UnitreeGo2SeqJumpEnvConfig,
     "unitree_go2_crate_climb": UnitreeGo2CrateEnvConfig,
     "allegro_reorient": AllegroReorientEnvConfig,
+    "block1d": Block1DEnvConfig,
 }
 
 
