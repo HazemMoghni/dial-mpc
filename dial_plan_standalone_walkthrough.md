@@ -29,7 +29,11 @@ explicitly marked **[interpretation]** or **[concern]**.
 | installed `lcm` Python module docstrings | exact `handle`/`handle_timeout`/queue semantics |
 | installed `jax_cosmo.scipy.interpolate` | spline math, k=2, extrapolation behavior |
 | `~/Repos/c3-lcs/analysis/dairlib/*.py` | LCM message definitions (wire layout) |
-| `~/Repos/c3-lcs/examples/c3-import/block1d/` | the Drake sim and the `INPUT_TRAJ` consumer |
+| `~/Repos/c3-lcs/.../block1d/block_sim.cc` | the Drake sim diagram, publishers, consumer wiring |
+| `~/Repos/c3-lcs/.../block1d/systems/spline_to_command.cc` | the `INPUT_TRAJ` tracking law |
+| `~/Repos/c3-lcs/.../block1d/systems/c3_trajectory_generator.cc` | the native producer being imitated |
+| `~/Repos/c3-lcs/.../block1d/parameters/*.yaml` (+ `test_matrix/`) | channels, gains `Kp/Kd/Ku`, rates, sim dt |
+| Drake header `piecewise_polynomial.h` (bazel cache) | `value(t)` out-of-range clamping semantics |
 
 ---
 
@@ -44,7 +48,8 @@ Three processes, connected by LCM (UDP-multicast pub/sub middleware):
 │                        │──────────────────────────────────────────────┤
 │  integrates physics,   │                                              ▼
 │  tracks INPUT_TRAJ     │                          ┌─────────────────────────────────┐
-│  with a PD+FF law      │   INPUT_TRAJ             │ dial_plan_standalone.py (this)  │
+│  (PD+FF law; gains     │   INPUT_TRAJ             │ dial_plan_standalone.py (this)  │
+│  today: FF-only, §6.2) │                          │                                 │
 │                        │◀─────────────────────────│ JAX/MJX sampling MPC planner    │
 └────────────────────────┘  (lcmt_timestamped_      │ replans a 0.3 s horizon per tick│
         ▲                    saved_traj)            └─────────────────────────────────┘
@@ -124,7 +129,7 @@ here do real work:
   - `from dial_mpc.examples import deploy_examples` loads the allow-list of example
     names; `"block1d_deploy"` is in it (`examples/__init__.py:13-19`).
   - `from dial_mpc.core.dial_core import DialConfig, MBDPI` pulls in the planner core
-    (§3.2). (`DialConfig` actually lives in `dial_mpc/core/dial_config.py`; `dial_core`
+    (§3.1). (`DialConfig` actually lives in `dial_mpc/core/dial_config.py`; `dial_core`
     re-exports it.)
 
 ### 1.3 LCM bindings and channel names (lines 47–58)
@@ -328,8 +333,9 @@ self.mbdpi = MBDPI(self.dial_config, self.env)
 
 ### 3.1 Sidetrack — `MBDPI.__init__` (`dial_core.py:51-89`)
 
-`MBDPI` ("Model-Based Diffusion / Path Integral") is the sampling-MPC core shared with
-the synchronous runner. Its constructor precomputes everything the per-tick update needs:
+`MBDPI` (presumably "Model-Based Diffusion Path Integral", after the papers DIAL-MPC
+builds on; the code never spells it out) is the sampling-MPC core shared with the
+synchronous runner. Its constructor precomputes everything the per-tick update needs:
 
 - `self.nu = env.action_size` → **1**.
 - `self.update_fn = softmax_update` (the only registered `update_method`, `"mppi"`).
@@ -548,10 +554,12 @@ def wait_for_fresh_state(self):
   reflects sim state published *after* the previous plan finished, i.e. the planner
   always plans from now, never from a queue backlog. Typically this loop runs exactly
   two `handle()` calls (one message per channel per sim publish tick).
-- **[interpretation]** The robot and block messages are only "paired" by arrival, not by
-  timestamp — if the sim publishes them at slightly different phases, `qpos` can mix a
-  robot state and block state one sim-tick apart. With both published from the same
-  Drake diagram at the same rate this is at most one publish period of skew.
+- The robot and block messages are only "paired" by arrival, not by timestamp — `qpos`
+  can mix a robot state and a block state from different sim ticks. The actual rates
+  (§6.1: robot 1000 Hz, block 100 Hz) mean the **block channel gates the loop**: a
+  fresh pair completes when the next 10 ms block message lands, at which point the
+  robot half is at most ~1 ms stale. Replanning therefore runs at ≤100 Hz regardless
+  of how fast the planner is.
 
 ### 4.2 `get_state_snapshot` (lines 137–146) — Drake wire → MuJoCo layout
 
@@ -944,10 +952,12 @@ time_vec = plan_time + np.asarray(self.mbdpi.step_us, dtype=np.float64)
   `ctrl=0.5` becomes `u = 3 N` on the wire. (`mj_model` here is the raw
   `mujoco.MjModel` the brax `System` still carries.)
 - The six-row `knots` matrix byte-imitates the layout the native C3 controller
-  publishes (its `OutputCombinedTrajectory`): rows `[u, x_ee, 0, 0, 0, v_ee]`. Rows
-  2–4 are zero-filled placeholders; the sim-side receiver reads the rows it needs and
-  the comment notes "consumer reads rows 0,1,2; Kd = 0 today" (§6 examines the
-  consumer). Columns are the 16 knot times.
+  publishes (its `OutputCombinedTrajectory`, confirmed in §6.3): rows
+  `[u, x_ee, 0, 0, 0, v_ee]`, columns = the 16 knot times. Rows 2–4 are zero-filled
+  placeholders. The line-238 comment "consumer reads rows 0,1,2; Kd = 0 today" is
+  literal: the sim-side tracking law reads its desired *velocity* from zero-filled
+  row 2, not row 5 — an inherited quirk of the native pipeline that is harmless while
+  `Kd = 0` (§6.2–6.3).
 - **`time_vec` is absolute sim time** — `plan_time + [0, 0.02, …, 0.30]` — so the
   consumer can interpolate "what should be happening at *its* current sim time"
   without any handshake about when the plan was made. The explicit `dtype=np.float64`
@@ -997,7 +1007,145 @@ to the loop-head check, which measured **sim-time** slippage. Then back to
 
 ## 6. The consumer side — what the sim does with `INPUT_TRAJ`
 
-<!-- C3-CONSUMER-SECTION -->
+The planner's output only makes sense in light of its consumer, so this section crosses
+into `~/Repos/c3-lcs/examples/c3-import/block1d/`. All of it is confirmed from source.
+
+### 6.1 `block_sim.cc` — the plant and its LCM surface
+
+`block_sim.cc:80-287` (`DoMain`) builds one Drake diagram:
+
+- A `MultibodyPlant` at `dt = 0.001` s (`block_sim_params.yaml`) containing the welded
+  EE model and the free block, with flat terrain. The simulator runs with
+  `set_target_realtime_rate(1.0)` and `AdvanceTo(∞)` (`block_sim.cc:262, 284`) — it
+  **paces itself to wall clock and never waits for the planner**. Note the Drake sim
+  steps 20× finer than the planner's 0.02 s rollout model.
+- **State out:** `AddActuationRecieverAndStateSenderLcm(...)` (`block_sim.cc:120-123`)
+  publishes the EE state as `lcmt_robot_output` on `ROBOT_STATE_SIMULATION` at
+  `robot_publish_rate = 1000` Hz (and subscribes to `ROBOT_INPUT` for actuation — see
+  below). An `ObjectStateSender` publishes the block as `lcmt_object_state` on
+  `BLOCK_STATE_SIMULATION` at `block_publish_rate = 100` Hz (`block_sim.cc:126-133`).
+  The Drake quat-first convention the planner un-shuffles in §4.2 is visible in the
+  sim's own init vector: `q_init_block = [1, 0, 0, 0, 0, 0, 0.05]` — identity
+  quaternion wxyz first, then xyz.
+- **Command in:** with `controller: C3` in `block_sim_params.yaml` (neither `"FCIMPC"`
+  nor `"MJPC"`), `block_sim.cc:224-235` takes the `else` branch: an
+  `LcmSubscriberSystem<lcmt_timestamped_saved_traj>` on `INPUT_TRAJ` feeds a
+  `SplineToRobotCommand` system directly (an `LcmTrajectoryReceiver` is constructed at
+  line 209 but its connections are commented out at 229–232). The command output goes
+  through `RobotCommandSender` to `ROBOT_INPUT` (`lcmt_robot_input`) at 1000 Hz, which
+  `AddActuationRecieverAndStateSenderLcm` turns into plant actuation.
+
+Two consequences for the planner loop:
+
+- `wait_for_fresh_state` is **gated by the slower channel**: robot states arrive at
+  1 kHz but block states only at 100 Hz, so a fresh *pair* completes when the next
+  block message lands — the replan cadence is at most ~100 Hz, and `shift_time` comes
+  out in ~10 ms quanta (or more, when planning takes longer). The arrival-pairing skew
+  flagged in §4.1 is bounded by one robot period, ~1 ms.
+- During the planner's ~30 s first-pass JIT, the sim receives no trajectory at all —
+  and commands **zero force** (see the placeholder logic below), so the scene just
+  sits there. This is the graceful counterpart of `skip_publish`.
+
+### 6.2 `SplineToRobotCommand` — the tracking law
+(`systems/spline_to_command.cc`)
+
+Constructed as `SplineToRobotCommand(u_size=1, update_freq=1000, Kp, Kd, Ku,
+"linear", "traj")` (`block_sim.cc:211-213`) with gains from the controller-options YAML
+(`parameters/test_matrix/1d_push.yaml`): **`Kp = [0.0]`, `Kd = [0.0]`, `Ku = [1.0]`**.
+
+It keeps one piece of abstract state: a Drake `PiecewisePolynomial` holding the current
+trajectory (initialized to a 2-knot zero placeholder, `spline_to_command.cc:43-55`).
+Two callbacks:
+
+- **`UpdateSplinePolynom`** (periodic, 1000 Hz; `spline_to_command.cc:83-98`): reads the
+  latest `lcmt_timestamped_saved_traj`, wraps it in `LcmTrajectory`, and calls
+  `GetTrajectory("position_force_target")` — **the trajectory name is the lookup key**,
+  which is why the planner must set `trajectory_name`/`trajectory_names` to exactly
+  that string (§5.8). It then rebuilds the stored polynomial as
+  `PiecewisePolynomial::FirstOrderHold(time_vector, datapoints)`: **linear
+  interpolation** between the 16 knots of all 6 rows, on the absolute sim-time axis
+  (the "cubic" option is dead code). An empty message (`num_trajectories == 0`) leaves
+  the previous trajectory in place.
+- **`CalcRobotInput`** (output port callback; `spline_to_command.cc:134-189`): evaluated
+  each time the 1 kHz command publisher pulls. It reads the robot state and
+  `robot_time` — the *timestamp of the latest robot-state message* (wired from the
+  state receiver's trailing timestamp element via a `SubvectorPassThrough`,
+  `block_sim.cc:166-167, 238-239`), i.e. the same clock the planner's `time_vec` lives
+  on. Then:
+
+  ```cpp
+  if (!traj_ux.has_value() || traj_ux->get_number_of_segments() == 1) {
+      u_sol_next.setZero();                  // placeholder ⇒ zero force
+  } else {
+      Eigen::VectorXd sol_des = traj_ux->value(robot_time);  // 6-vector at "now"
+      u_sol_des = sol_des.col(0).segment(0, 1);   // row 0: feedforward force
+      q_sol_des = sol_des.col(0).segment(1, 1);   // row 1: desired EE x
+      v_sol_des = sol_des.col(0).segment(2, 1);   // row 2: desired EE ẋ  (!)
+      u_sol_next = u_sol_des.cwiseProduct(Ku_)
+                 + (q_sol_des - q_current).cwiseProduct(Kp_)
+                 + (v_sol_des - v_current).cwiseProduct(Kd_);
+  }
+  ```
+
+  So the intended law is `u = Ku·u_ff + Kp·(x_des − x) + Kd·(ẋ_des − ẋ)` — but with the
+  current gains it degenerates to **pure feedforward: `u = u_ff`**, the row-0 force the
+  planner computed (already in newtons thanks to the gear scaling, §5.8). Rows 1 and 5
+  are transmitted but, today, change nothing.
+
+Drake detail (confirmed in `piecewise_polynomial.h`): `value(t)` outside the
+trajectory's time range "will silently be evaluated at the closest point" — so if the
+planner stalls past `plan_time + 0.3 s`, the sim **holds the last knot's force**
+indefinitely; no extrapolation, no zeroing.
+
+### 6.3 What "byte-imitates C3" means — the native producer
+
+The native C3 controller (run via `block_c3_controller`) publishes `INPUT_TRAJ` from
+`C3TrajectoryGenerator::OutputCombinedTrajectory`
+(`systems/c3_trajectory_generator.cc:74-104`):
+
+```cpp
+MatrixXd knots = MatrixXd::Zero(6, N_);
+knots.topRows(n_u_)    = c3_solution->u_sol_;                                  // row 0: u
+knots.row(n_u_)        = c3_solution->x_sol_.topRows(n_u_).row(0);             // row 1: x_ee
+knots.bottomRows(n_u_) = c3_solution->x_sol_.bottomRows(n_v_).topRows(n_u_);   // row 5: v_ee
+```
+
+With `n_u_ = 1` that is exactly `[u, x_ee, 0, 0, 0, v_ee]` — six rows, velocity in the
+**bottom** row — wrapped in an `LcmTrajectory` named `position_force_target`, with
+`utime = context.get_time()·1e6`. The standalone planner reproduces this layout
+byte-for-byte (§5.8) so the sim-side consumer can't tell the two producers apart.
+
+**[concern — inherited, not introduced]** Note the producer/consumer row mismatch is
+*native to c3-lcs*: the producer writes `v_ee` to row 5, while `CalcRobotInput` reads
+`v_des` from row 2 (always zero). A comment at `c3_trajectory_generator.cc:89-90`
+("u, u, xee, xee, vee, vee >> before / u, xee, vee >> now") suggests the 6-row layout
+is a remnant of a 2-actuator version. With `Kd = 0` the mismatch is inert for both
+producers; if `Kd` is ever raised, the velocity term will use `0 − ẋ` (pure damping),
+not the planned velocity — for *both* the native C3 and this planner. The
+standalone's line-238 comment ("consumer reads rows 0,1,2; Kd = 0 today") documents
+precisely this.
+
+### 6.4 The closed loop, end to end
+
+```
+ DIAL planner (this file)                         block_sim (Drake, 1 kHz physics @ 1 ms)
+ ───────────────────────                          ──────────────────────────────────────
+ Y ──node2u──▶ taus ──×gear──▶ row 0 ┐            INPUT_TRAJ ─▶ FirstOrderHold (6×16)
+ qbar[-1][:,7]  ──────────────▶ row 1 ├─ INPUT_TRAJ ─▶  u = 1·u_ff + 0·(…) + 0·(…)
+ qdbar[-1][:,6] ──────────────▶ row 5 ┘            ─▶ ROBOT_INPUT ─▶ EE actuation
+        ▲                                          plant integrates; block slides
+        │                                          ─▶ ROBOT_STATE_SIMULATION (1 kHz)
+ wait_for_fresh_state ◀────────────────────────────▶ BLOCK_STATE_SIMULATION (100 Hz)
+```
+
+One more cross-stack asymmetry worth knowing: the planner's force authority is
+`±6 N` (MJX `gear·ctrlrange`), while the native C3 options allow `±20 N`
+(`u_horizontal_limits`, `test_matrix/1d_push.yaml`) — the DIAL plans are strictly
+inside the sim's feasible input set. And because `Kp = Kd = 0`, the EE tracks the plan
+**open-loop between replans**: any mismatch between the 0.02 s MJX model and the
+0.001 s Drake plant is corrected only by the next replan's fresh state, not by
+feedback — which makes the ~100 Hz replan rate the loop's only stabilizer.
+**[interpretation]**
 
 ---
 
@@ -1038,39 +1186,55 @@ to the loop-head check, which measured **sim-time** slippage. Then back to
    below.
 5. The `(6,16)` `datapoints` orientation matches the LCM type's declared
    `double[num_datatypes][num_points]`.
+6. The `INPUT_TRAJ` consumer is `SplineToRobotCommand` inside `block_sim` itself
+   (`block_sim.cc:211-235`): FirstOrderHold (linear) interpolation of all six rows on
+   the absolute sim clock, law `u = Ku·u_ff + Kp·(x_des−x) + Kd·(ẋ_des−ẋ)` with
+   configured gains `Ku=1, Kp=0, Kd=0` — i.e. today the sim executes the planner's
+   feedforward force verbatim and ignores rows 1–5 (§6.2).
+7. The native producer writes `[u, x_ee, 0, 0, 0, v_ee]`
+   (`c3_trajectory_generator.cc:81-85`) while the consumer reads rows 0/1/2 — the
+   row-2-vs-row-5 velocity mismatch is native to c3-lcs, and this planner imitates the
+   producer faithfully (§6.3).
+8. Drake's `PiecewisePolynomial::value(t)` clamps to the closest endpoint outside the
+   trajectory's range, so a stale plan means the sim holds the last knot's force
+   (§6.2); before any plan arrives, the placeholder trajectory commands zero force.
 
 **Interpretations (reasoned, not stated anywhere):**
 
-6. `qbar/qdbar` as tracking references are a softmax-weighted average of sampled
+9. `qbar/qdbar` as tracking references are a softmax-weighted average of sampled
    rollouts, an approximation of "the state trajectory under the published plan"
    (§5.6, step 4).
-7. `reset` is used purely as an info-dict template factory; the keyframe state it
-   builds is discarded (§4.3).
-8. The spline `shift` with extrapolating tail is the asynchronous generalization of
-   `dial_core.shift`'s roll-and-zero (§5.3).
+10. `reset` is used purely as an info-dict template factory; the keyframe state it
+    builds is discarded (§4.3).
+11. The spline `shift` with extrapolating tail is the asynchronous generalization of
+    `dial_core.shift`'s roll-and-zero (§5.3).
+12. With `Kp = Kd = 0`, the loop is feedforward-between-replans: the ≤100 Hz replan
+    rate is the only feedback path correcting MJX-vs-Drake model mismatch (§6.4).
 
 **Concerns (possible issues, none fatal for this task):**
 
-9. **One-`dt` misalignment between published rows.** `rollout_us` collects the state
-   *after* each step, so `qbar[k]` is the predicted state at `plan_time+(k+1)·0.02`,
-   while `time_vec[k] = plan_time + k·0.02` and `u_row[k]` is the control *applied
-   during* `[k·0.02, (k+1)·0.02)`. Rows 1/5 (position/velocity targets) therefore lead
-   their timestamps by one control period (20 ms). With feedforward-dominant tracking
-   and Kd = 0 this is minor, but a position-feedback consumer would chase a slightly
-   future target. (Also, `q[0]` — the prediction one step ahead — is published at
-   `time_vec[0] = plan_time`, "now".)
-10. **`pipeline_init` omits `mjx.forward`** (vs brax 0.14.1 `init`), leaving
+13. **One-`dt` misalignment between published rows.** `rollout_us` collects the state
+    *after* each step, so `qbar[k]` is the predicted state at `plan_time+(k+1)·0.02`,
+    while `time_vec[k] = plan_time + k·0.02` and `u_row[k]` is the control *applied
+    during* `[k·0.02, (k+1)·0.02)`. Rows 1/5 (position/velocity targets) therefore lead
+    their timestamps by one control period (20 ms). Inert today (`Kp = Kd = 0` means
+    rows 1/5 are never read into the command, §6.2), but if `Kp` is ever raised the
+    position feedback would chase a target 20 ms in the future. (Also, `q[0]` — the
+    prediction one step ahead — is published at `time_vec[0] = plan_time`, "now".)
+14. **`pipeline_init` omits `mjx.forward`** (vs brax 0.14.1 `init`), leaving
     `x/xd/contact` inconsistent with `(q, qd)` in the initial state. Harmless for
     block1d (nothing reads them before the next `mjx.step`), but a trap for envs whose
     `_get_obs`/reward touch body poses of the initial state (§3.4).
-11. **`MBDPI.ctrl_dt` is hard-coded 0.02**, independent of `env_config.dt`; the two
+15. **`MBDPI.ctrl_dt` is hard-coded 0.02**, independent of `env_config.dt`; the two
     agree here only because the YAML uses 0.02 (§3.1).
-12. **Robot/block snapshot pairing is by arrival, not timestamp** — worst case one sim
-    publish period of skew between the two halves of `qpos` (§4.1). `t` comes from the
-    robot message only.
-13. Dead code inherited from upstream: `sigma0/sigma1/A/B` locals and the broken
+16. **Robot/block snapshot pairing is by arrival, not timestamp** — the block half of
+    `qpos` is fresh, the robot half up to ~1 ms stale (§4.1); `t` comes from the robot
+    message only.
+17. Dead code inherited from upstream: `sigma0/sigma1/A/B` locals and the broken
     `MBDPI.reverse` (`self.sigmas` never exists); `tqdm` imported unused; `[WRAN]`
-    typos in both overtime warnings.
-14. First pass runs `Ndiffuse_init + Ndiffuse` = 11 iterations across two scans of
+    typos in both overtime warnings; and the `base_env.py:16` assertion message is
+    backwards — it says "timestep must be divisible by dt" while the expression checks
+    `dt % timestep == 0` (dt must be an integer multiple of timestep).
+18. First pass runs `Ndiffuse_init + Ndiffuse` = 11 iterations across two scans of
     different lengths, costing two XLA scan compilations during warm-up (§5.4–5.5) —
     intended behavior, but worth knowing when profiling startup.

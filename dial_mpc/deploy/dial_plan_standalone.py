@@ -48,7 +48,6 @@ from dial_mpc.examples import deploy_examples
 from dairlib import (
     lcmt_robot_output,
     lcmt_object_state,
-    lcmt_timestamped_saved_traj,
     lcmt_trajectory_block,
 )
 
@@ -86,8 +85,12 @@ def pipeline_init(
 
 class MBDPublisher_standalone:
     def __init__(
-        self, env: BaseEnv, env_config: BaseEnvConfig, dial_config: DialConfig
+        self, env: BaseEnv, env_config: BaseEnvConfig, dial_config: DialConfig,
+        sim_q_init=None,
     ):
+        # trial's true initial qpos (mujoco order); when set, the JIT warm-up
+        # doubles as the first real plan, published at t=0 before the sim runs
+        self.sim_q_init = sim_q_init
         # MBD related
         # setup MBDPI controller
         self.dial_config = dial_config
@@ -141,14 +144,38 @@ class MBDPublisher_standalone:
         p = block.position
         v = block.velocity
         # wire is quat-first / angular-first (drake); mujoco is pos-first / linear-first
-        qpos = np.array([p[4], p[5], p[6], p[0], p[1], p[2], p[3], robot.position[0]])
-        qvel = np.array([v[3], v[4], v[5], v[0], v[1], v[2], robot.velocity[0]])
+        qpos = np.array([p[4], p[5], p[6], p[0], p[1], p[2], p[3], robot.position[0]],
+                        dtype=np.float32)
+        qvel = np.array([v[3], v[4], v[5], v[0], v[1], v[2], robot.velocity[0]],
+                        dtype=np.float32)
         return t, qpos, qvel
 
     def shift(self, x, shift_time):
         spline = InterpolatedUnivariateSpline(self.mbdpi.step_nodes, x, k=2)
         x_new = spline(self.mbdpi.step_nodes + shift_time)
         return x_new
+
+    def publish_plan(self, taus, info, plan_time):
+        # MJPC-branch "points" input: bare lcmt_trajectory_block with
+        # rows [u, x_ee, v_ee] (SplineToRobotCommand reads rows 0,1,2)
+        gear = self.env.sys.mj_model.actuator_gear[0, 0]
+        q = np.asarray(info["qbar"][-1])
+        v = np.asarray(info["qdbar"][-1])
+        knots = np.vstack([
+            np.asarray(taus)[:, 0] * gear,
+            q[:, 7],
+            v[:, 6],
+        ])
+        # absolute sim seconds; float64 since step_us is float32
+        time_vec = plan_time + np.asarray(self.mbdpi.step_us, dtype=np.float64)
+        traj = lcmt_trajectory_block()
+        traj.trajectory_name = "position_force_target"
+        traj.num_points = knots.shape[1]
+        traj.num_datatypes = knots.shape[0]
+        traj.time_vec = time_vec.tolist()
+        traj.datapoints = knots.tolist()
+        traj.datatypes = ["double"] * knots.shape[0]
+        self.lc.publish(TRAJ_CHANNEL, traj.encode())
 
     def init_mjx_state(self, q, qd, t):
         state = self.env.reset(jax.random.PRNGKey(0))
@@ -173,14 +200,49 @@ class MBDPublisher_standalone:
             rng, Y0, info = self.mbdpi.reverse_once(state, rng, Y0, factor)
             return (rng, Y0, state), info
 
-        # first "input" state for the planner
-        last_plan_time, qpos, qvel = self.wait_for_fresh_state()
-        state = self.init_mjx_state(qpos, qvel, last_plan_time)
+        # JIT warmup before the sim starts, so the experiment never waits on
+        # compilation. With sim_q_init it runs on the trial's true initial state
+        # and its solution is the first real plan; otherwise on the home keyframe.
+        print("Performing JIT on DIAL-MPC")
+        if self.sim_q_init is not None:
+            qpos0 = self.sim_q_init
+        else:
+            qpos0 = np.array(self.env.sys.mj_model.keyframe("home").qpos, dtype=np.float32)
+        qvel0 = np.zeros(self.env.sys.mj_model.nv, dtype=np.float32)
+        state = self.init_mjx_state(jnp.array(qpos0), jnp.array(qvel0), 0.0)
+        # numpy qpos/qvel like every loop iteration, else the scan compiles a second
+        # executable for the loop's input sharding (~4 s stall on the first real state)
+        state = self.update_mjx_state(state, qpos0, qvel0, 0.0)
+        for n_diffuse in (self.dial_config.Ndiffuse_init, self.dial_config.Ndiffuse):
+            traj_diffuse_factors = (
+                self.dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
+            )
+            (self.rng, self.Y, _), info = jax.lax.scan(
+                reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
+            )
+        self.Y = self.shift_vmap(self.Y, 0.0)
+        us = self.mbdpi.node2u_vmap(self.Y)
+        if hasattr(self.env, "act2ctrl"):
+            taus = self.env.act2ctrl(us)
+        else:
+            taus = self.env.act2tau(us, state.pipeline_state)
+        print("JIT done, waiting for sim")
 
-        first_time = True
+        if self.sim_q_init is not None:
+            # publish the t=0 plan until the sim consumes it and states flow;
+            # the sim's subscriber may not exist yet, so keep republishing
+            while not (self.received_robot and self.received_block):
+                self.publish_plan(taus, info, 0.0)
+                self.lc.handle_timeout(50)
+            last_plan_time = 0.0
+        else:
+            # first "input" state for the planner
+            last_plan_time, qpos, qvel = self.wait_for_fresh_state()
+            state = self.update_mjx_state(state, qpos, qvel, last_plan_time)
+
         while True:
             t0 = time.time()
-            # get state; the "input" state for the planner (after initializing)
+            # get state; the "input" state for the planner
             plan_time, qpos, qvel = self.wait_for_fresh_state()
             state = self.update_mjx_state(state, qpos, qvel, plan_time)
             # shift Y
@@ -195,28 +257,9 @@ class MBDPublisher_standalone:
             else:
                 self.Y = self.shift_vmap(self.Y, shift_time)
             # run planner
-            skip_publish = first_time
-            n_diffuse = self.dial_config.Ndiffuse
-            if first_time:
-                print("Performing JIT on DIAL-MPC")
-                n_diffuse = self.dial_config.Ndiffuse_init
-                first_time = False
-                # scale the noise by the per-node schedule MBDPI.sigma_control, as
-                # dial_core.py does. Without it every node gets flat noise 1.0 and
-                # sigma_scale / horizon_diffuse_factor become inert.
-                traj_diffuse_factors = (
-                    self.mbdpi.sigma_control[None, :]
-                    * self.dial_config.traj_diffuse_factor
-                    ** (jnp.arange(n_diffuse))[:, None]
-                )
-                (self.rng, self.Y, _), info = jax.lax.scan(
-                    reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
-                )
-                n_diffuse = self.dial_config.Ndiffuse
-            # same per-node sigma_control scaling as above (dial_core.py parity)
             traj_diffuse_factors = (
-                self.mbdpi.sigma_control[None, :]
-                * self.dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
+                self.dial_config.traj_diffuse_factor
+                ** (jnp.arange(self.dial_config.Ndiffuse))[:, None]
             )
             (self.rng, self.Y, _), info = jax.lax.scan(
                 reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
@@ -230,39 +273,24 @@ class MBDPublisher_standalone:
                 taus = self.env.act2ctrl(us)
             else:
                 taus = self.env.act2tau(us, state.pipeline_state)
-            # first plan is ~30 s of JIT; its time_vec would be stale, so don't send it
-            if skip_publish:
-                last_plan_time = plan_time
-                continue
-            # publish; byte-imitates C3's OutputCombinedTrajectory rows
-            # [u, x_ee, 0, 0, 0, v_ee] (consumer reads rows 0,1,2; Kd = 0 today)
-            gear = self.env.sys.mj_model.actuator_gear[0, 0]
-            q = np.asarray(info["qbar"][-1])
-            v = np.asarray(info["qdbar"][-1])
-            u_row = np.asarray(taus)[:, 0] * gear
-            knots = np.zeros((6, q.shape[0]))
-            knots[0] = u_row
-            knots[1] = q[:, 7]
-            knots[5] = v[:, 6]
-            # absolute sim seconds; float64 since step_us is float32
-            time_vec = plan_time + np.asarray(self.mbdpi.step_us, dtype=np.float64)
-            traj = lcmt_trajectory_block()
-            traj.trajectory_name = "position_force_target"
-            traj.num_points = knots.shape[1]
-            traj.num_datatypes = knots.shape[0]
-            traj.time_vec = time_vec.tolist()
-            traj.datapoints = knots.tolist()
-            traj.datatypes = ["double"] * knots.shape[0]
-            msg = lcmt_timestamped_saved_traj()
-            msg.utime = int(plan_time * 1e6)
-            msg.saved_traj.num_trajectories = 1
-            msg.saved_traj.trajectories = [traj]
-            msg.saved_traj.trajectory_names = ["position_force_target"]
-            self.lc.publish(TRAJ_CHANNEL, msg.encode())
+            self.publish_plan(taus, info, plan_time)
             # record time
             last_plan_time = plan_time
             if time.time() - t0 > self.ctrl_dt:
                 print(f"[WRAN] real overtime {(time.time()-t0)*1000:.1f} ms")
+
+
+# DialConfig fields exposed as CLI overrides for experiment sweeps
+DIAL_OVERRIDE_FIELDS = [
+    ("seed", int),
+    ("Nsample", int),
+    ("Hsample", int),
+    ("Hnode", int),
+    ("Ndiffuse", int),
+    ("Ndiffuse_init", int),
+    ("temp_sample", float),
+    ("traj_diffuse_factor", float),
+]
 
 
 def main(args=None):
@@ -289,6 +317,21 @@ def main(args=None):
         default=None,
         help="Custom environment to import dynamically",
     )
+    parser.add_argument(
+        "--sim-config",
+        type=str,
+        default=None,
+        help="Drake sim params yaml; plan for its q_init at t=0 instead of "
+        "warming up on the home keyframe",
+    )
+    # experiment-sweep overrides; when omitted the config file value is used
+    for flag, cast in DIAL_OVERRIDE_FIELDS:
+        parser.add_argument(
+            f"--{flag}",
+            type=cast,
+            default=None,
+            help=f"Override {flag} from the config file",
+        )
     args = parser.parse_args(args)
 
     if args.custom_env is not None:
@@ -310,6 +353,11 @@ def main(args=None):
     else:
         config_dict = yaml.safe_load(open(args.config, "r"))
 
+    for flag, _ in DIAL_OVERRIDE_FIELDS:
+        value = getattr(args, flag)
+        if value is not None:
+            config_dict[flag] = value
+
     print(emoji.emojize(":rocket:") + "Creating environment")
     dial_config = load_dataclass_from_dict(DialConfig, config_dict)
     env_config_type = dial_envs.get_config(dial_config.env_name)
@@ -318,7 +366,20 @@ def main(args=None):
     )
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
 
-    mbd_publisher = MBDPublisher_standalone(env, env_config, dial_config)
+    sim_q_init = None
+    if args.sim_config is not None:
+        sim_cfg = yaml.safe_load(open(args.sim_config, "r"))
+        qb = sim_cfg["q_init_block"]
+        # drake yaml is quat-first; mujoco qpos is [block xyz, quat wxyz, ee_x]
+        # (same reordering as get_state_snapshot)
+        sim_q_init = np.array(
+            [qb[4], qb[5], qb[6], qb[0], qb[1], qb[2], qb[3],
+             sim_cfg["q_init"][0]],
+            dtype=np.float32,
+        )
+
+    mbd_publisher = MBDPublisher_standalone(env, env_config, dial_config,
+                                            sim_q_init=sim_q_init)
 
     try:
         mbd_publisher.main_loop()

@@ -198,22 +198,16 @@ class MBDPublisher:
                 print("Performing JIT on DIAL-MPC")
                 n_diffuse = self.dial_config.Ndiffuse_init
                 first_time = False
-                # scale the noise by the per-node schedule MBDPI.sigma_control, as
-                # dial_core.py does. Without it every node gets flat noise 1.0 and
-                # sigma_scale / horizon_diffuse_factor become inert.
                 traj_diffuse_factors = (
-                    self.mbdpi.sigma_control[None, :]
-                    * self.dial_config.traj_diffuse_factor
+                    self.dial_config.traj_diffuse_factor
                     ** (jnp.arange(n_diffuse))[:, None]
                 )
                 (self.rng, self.Y, _), info = jax.lax.scan(
                     reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
                 )
                 n_diffuse = self.dial_config.Ndiffuse
-            # same per-node sigma_control scaling as above (dial_core.py parity)
             traj_diffuse_factors = (
-                self.mbdpi.sigma_control[None, :]
-                * self.dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
+                self.dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
             )
             (self.rng, self.Y, _), info = jax.lax.scan(
                 reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
